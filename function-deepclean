@@ -1,0 +1,451 @@
+# Cleanup Script!
+
+# ---------------------------------------Setup ---------------------------------------
+
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
+param(
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]$LogPath = "C:\Logs\Maintenance",
+
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string[]]$NtpServers = @("pool.ntp.org","time.cloudflare.com","time.google.com","time.windows.com"),
+
+    [Parameter()]
+    [ValidateRange(1, 600000)]
+    [int]$OffsetThresholdMs = 500,
+
+    [Parameter()]
+    [switch]$Reboot,
+
+    [Parameter()]
+    [switch]$NoTranscript
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+function Test-IsAdmin {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $p  = [Security.Principal.WindowsPrincipal]::new($id)
+    return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Ensure-Directory {
+    param([Parameter(Mandatory)] [string]$Path)
+
+    if (Test-Path -LiteralPath $Path) { return }
+
+    try {
+        New-Item -ItemType Directory -Path $Path -Force | Out-Null
+    } catch {
+        throw ("Unable to create log directory '{0}'. {1}" -f $Path, $_.Exception.Message)
+    }
+}
+
+function New-LogFilePath {
+    param([Parameter(Mandatory)] [string]$Dir)
+
+    $name = "SystemHealthCheck-{0:yyyy-MM-dd_HH-mm-ss}.log" -f (Get-Date)
+    return (Join-Path -Path $Dir -ChildPath $name)
+}
+
+$TaskResults = [System.Collections.Generic.List[psobject]]::new()
+function Add-TaskResult {
+    param(
+        [Parameter(Mandatory)] [string]$Task,
+        [Parameter(Mandatory)] [bool]$Success,
+        [Parameter(Mandatory)] [string]$Message
+    )
+
+    $TaskResults.Add([pscustomobject]@{
+        Task    = $Task
+        Success = $Success
+        Message = $Message
+    }) | Out-Null
+}
+
+function Invoke-Task {
+    param(
+        [Parameter(Mandatory)] [string]$Name,
+        [Parameter(Mandatory)] [scriptblock]$Block
+    )
+
+    try {
+        & $Block
+        return $true
+    } catch {
+        Add-TaskResult -Task $Name -Success $false -Message $_.Exception.Message
+        Write-Error ("Task '{0}' failed. {1}" -f $Name, $_.Exception.Message)
+        return $false
+    }
+}
+
+Ensure-Directory -Path $LogPath
+$LogFile = New-LogFilePath -Dir $LogPath
+
+$script:TranscriptStarted = $false
+if (-not $NoTranscript) {
+    try {
+        Start-Transcript -Path $LogFile -Force | Out-Null
+        $script:TranscriptStarted = $true
+    } catch {
+        Write-Warning ("Failed to start transcript. {0}" -f $_.Exception.Message)
+    }
+}
+
+Write-Verbose ("System maintenance started. Log: {0}" -f $LogFile)
+Write-Host ""
+Write-Host "System Maintenance Started!" -ForegroundColor Cyan
+
+function Create-RestorePoint {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param()
+
+    $task = "Create-RestorePoint"
+
+    if (-not (Test-IsAdmin)) {
+        Add-TaskResult -Task $task -Success $false -Message "Requires elevation. Run PowerShell as Administrator."
+        Write-Warning "Restore point skipped because the session is not elevated."
+        return $false
+    }
+
+    if (-not $PSCmdlet.ShouldProcess("System Restore", "Create restore point")) {
+        Add-TaskResult -Task $task -Success $false -Message "Skipped by ShouldProcess."
+        return $false
+    }
+
+    Write-Verbose "Creating restore point..."
+    Checkpoint-Computer -Description ("Pre-Maintenance {0:yyyy-MM-dd HH:mm}" -f (Get-Date)) -RestorePointType "MODIFY_SETTINGS"
+    Add-TaskResult -Task $task -Success $true -Message "Restore point created."
+    return $true
+}
+
+function Perform-WindowsUpdate {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param()
+
+    $task = "Perform-WindowsUpdate"
+
+    if (-not (Get-Module -ListAvailable -Name PSWindowsUpdate)) {
+        Add-TaskResult -Task $task -Success $false -Message "PSWindowsUpdate module not found."
+        Write-Warning "PSWindowsUpdate not found. Skipping Windows Update."
+        return $false
+    }
+
+    if (-not $PSCmdlet.ShouldProcess("Windows Update", "Install available updates")) {
+        Add-TaskResult -Task $task -Success $false -Message "Skipped by ShouldProcess."
+        return $false
+    }
+
+    Import-Module PSWindowsUpdate -Force -ErrorAction Stop
+
+    Write-Verbose "Installing updates with PSWindowsUpdate (no auto reboot)..."
+    Get-WindowsUpdate -Install -AcceptAll -IgnoreReboot -ErrorAction Stop | Out-Null
+
+    Add-TaskResult -Task $task -Success $true -Message "Updates installed (if any). Reboot may be required."
+    return $true
+}
+
+function Run-SystemFileChecks {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param()
+
+    $task = "Run-SystemFileChecks"
+
+    if (-not $PSCmdlet.ShouldProcess("System integrity", "Run SFC and DISM checks")) {
+        Add-TaskResult -Task $task -Success $false -Message "Skipped by ShouldProcess."
+        return $false
+    }
+
+    if (-not (Test-IsAdmin)) {
+        Add-TaskResult -Task $task -Success $false -Message "Requires elevation. Run PowerShell as Administrator."
+        Write-Warning "SFC and DISM skipped because the session is not elevated."
+        return $false
+    }
+
+    Write-Verbose "Running sfc /scannow..."
+    & sfc /scannow 
+    $sfcExit = $LASTEXITCODE
+
+    Write-Verbose "Running DISM ScanHealth..."
+    $scan = & DISM.exe /Online /Cleanup-Image /ScanHealth 2>&1
+    $scanText = ($scan -join "`n")
+
+    $dismAction = "ScanHealth"
+    if ($scanText -match "The component store is repairable") {
+        Write-Verbose "DISM reports repairable corruption. Running RestoreHealth..."
+        & DISM.exe /Online /Cleanup-Image /RestoreHealth 
+        $dismAction = "RestoreHealth"
+    }
+
+    Add-TaskResult -Task $task -Success $true -Message ("SFC exit={0}, DISM={1} completed." -f $sfcExit, $dismAction)
+    return $true
+}
+
+function Cleanup-Files {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param()
+
+    $task = "Cleanup-Files"
+
+    $targets = @(
+        @{ Name = "User Temp"; Path = $env:TEMP },
+        @{ Name = "System Temp"; Path = (Join-Path $env:windir "Temp") },
+        @{ Name = "Windows Update Cache"; Path = (Join-Path $env:windir "SoftwareDistribution\Download") }
+    )
+
+    $ok = $true
+
+    foreach ($t in $targets) {
+        $name = [string]$t.Name
+        $path = [string]$t.Path
+
+        if (-not (Test-Path -LiteralPath $path)) {
+            Write-Verbose ("Cleanup target not found: {0}" -f $path)
+            continue
+        }
+
+        if (-not $PSCmdlet.ShouldProcess($path, ("Cleanup {0}" -f $name))) {
+            continue
+        }
+
+        try {
+            Get-ChildItem -LiteralPath $path -Force -ErrorAction SilentlyContinue |
+                Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+
+            Write-Verbose ("Cleaned {0}: {1}" -f $name, $path)
+        } catch {
+            $ok = $false
+            Write-Warning ("Cleanup failed for '{0}'. {1}" -f $name, $_.Exception.Message)
+        }
+    }
+
+    try {
+        ipconfig /flushdns | Out-Null
+        Write-Verbose "Flushed DNS cache."
+    } catch {
+        $ok = $false
+        Write-Warning ("Failed to flush DNS cache. {0}" -f $_.Exception.Message)
+    }
+
+    $msg = if ($ok) { "Cleanup completed." } else { "Cleanup completed with errors." }
+    Add-TaskResult -Task $task -Success $ok -Message $msg
+
+    return $ok
+}
+
+function Optimize-Drives {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param()
+
+    $task = "Optimize-Drives"
+
+    $drives = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DriveType = 3" |
+        Select-Object -ExpandProperty DeviceID
+
+    $hasOptimizeVolume = $false
+    try {
+        if (Get-Module -ListAvailable Storage) {
+            Import-Module Storage -ErrorAction Stop
+            $hasOptimizeVolume = [bool](Get-Command Optimize-Volume -ErrorAction SilentlyContinue)
+        }
+    } catch {
+        $hasOptimizeVolume = $false
+    }
+
+    foreach ($d in $drives) {
+        if (-not $PSCmdlet.ShouldProcess($d, "Optimize drive")) { continue }
+
+        try {
+            if ($hasOptimizeVolume) {
+                Optimize-Volume -DriveLetter $d.TrimEnd(':') -ReTrim -SlabConsolidate -ErrorAction Stop | Out-Null
+                Write-Verbose ("Optimized {0} via Optimize-Volume" -f $d)
+            } else {
+                # Fallback, works when Storage module is missing.
+                & defrag.exe $d /O | Out-Null
+                Write-Verbose ("Optimized {0} via defrag.exe" -f $d)
+            }
+        } catch {
+            Write-Warning ("Optimization failed for {0}. {1}" -f $d, $_.Exception.Message)
+        }
+    }
+
+    if (-not $hasOptimizeVolume) {
+        Add-TaskResult -Task $task -Success $true -Message "Optimize-Volume unavailable, used defrag.exe fallback."
+        return $true
+    }
+
+    Add-TaskResult -Task $task -Success $true -Message "Volume optimization attempted via Optimize-Volume."
+    return $true
+}
+
+function Get-NtpOffsetMs {
+    param(
+        [Parameter(Mandatory)] [string]$Server,
+        [ValidateRange(1, 50)]
+        [int]$Samples = 6
+    )
+
+    $out = & w32tm /stripchart /computer:$Server /dataonly /samples:$Samples 2>$null
+    if (-not $out) { return $null }
+
+    $offsets = foreach ($line in $out) {
+        if ($line -match "([-+]?(\d+(\.\d+)?))s") {
+            [double]$matches[1] * 1000.0
+        }
+    }
+
+    if (-not $offsets) { return $null }
+    return [int][Math]::Round((($offsets | Measure-Object -Average).Average))
+}
+
+function Resync-Time {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param()
+
+    $task = "Resync-Time"
+
+    $peerDesc = $NtpServers -join ", "
+    if (-not $PSCmdlet.ShouldProcess("Time sync", ("Configure peers: {0}" -f $peerDesc))) {
+        Add-TaskResult -Task $task -Success $false -Message "Skipped by ShouldProcess."
+        return $false
+    }
+
+    $svc = Get-Service -Name w32time -ErrorAction SilentlyContinue
+    if (-not $svc) {
+        Add-TaskResult -Task $task -Success $false -Message "w32time service not found."
+        Write-Warning "Windows Time service not found."
+        return $false
+    }
+
+    if ($svc.Status -ne 'Running') {
+        Start-Service -Name w32time -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 2
+    }
+
+    $peerList = $NtpServers -join " "
+    & w32tm /config /manualpeerlist:$peerList /syncfromflags:manual /update | Out-Null
+    & w32tm /resync /force | Out-Null
+
+    $best = $null
+    $bestServer = $null
+
+    foreach ($s in $NtpServers) {
+        $ms = Get-NtpOffsetMs -Server $s -Samples 6
+        if ($null -eq $ms) { continue }
+
+        Write-Verbose ("Offset estimate from {0}: {1}ms" -f $s, $ms)
+        if ($null -eq $best -or ([Math]::Abs($ms) -lt [Math]::Abs($best))) {
+            $best = $ms
+            $bestServer = $s
+        }
+    }
+
+    if ($null -eq $best) {
+        Add-TaskResult -Task $task -Success $false -Message "Resync attempted, but offset measurement failed."
+        return $false
+    }
+
+    $abs = [Math]::Abs($best)
+    if ($abs -gt $OffsetThresholdMs) {
+        Add-TaskResult -Task $task -Success $false -Message ("Offset {0}ms exceeds threshold {1}ms (best server {2})." -f $abs, $OffsetThresholdMs, $bestServer)
+        Write-Warning ("Time offset {0}ms exceeds threshold {1}ms (best server {2})." -f $abs, $OffsetThresholdMs, $bestServer)
+        return $false
+    }
+
+    Add-TaskResult -Task $task -Success $true -Message ("Time resync OK. Offset {0}ms (best server {1})." -f $abs, $bestServer)
+    return $true
+}
+
+function Invoke-RebootIfRequested {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param()
+
+    $task = "Reboot"
+
+    $required  = [bool]($script:RebootRequired)
+    $requested = [bool]$Reboot
+
+    # COA 1: Reboot required by updates.
+    # Always reboot (no y/n) with 10s countdown, unless ShouldProcess blocks it.
+    if ($required) {
+        if (-not $PSCmdlet.ShouldProcess("Computer", "Restart (required by updates)")) {
+            Add-TaskResult -Task $task -Success $false -Message "Reboot required, skipped by ShouldProcess."
+            return $false
+        }
+
+        Add-TaskResult -Task $task -Success $true -Message "Restart initiated. Required by Windows Update."
+
+        Write-Host ""
+        Write-Host "Reboot required by updates. Rebooting in 5 seconds. Press Ctrl+C to cancel." -ForegroundColor Yellow
+        for ($i = 5; $i -gt 0; $i--) {
+            Write-Host ("Rebooting in {0}..." -f $i) -ForegroundColor Yellow
+            Start-Sleep -Seconds 1
+        }
+
+        Restart-Computer -Force
+        return
+    }
+
+    # COA 2: Not required by updates.
+    # If -Reboot was passed, reboot (no prompt). Otherwise prompt y/n.
+    if (-not $requested) {
+        $answer = Read-Host "Reboot is not required. Reboot anyway? (y/N)"
+        if ($answer -notin @('y','Y')) {
+            Add-TaskResult -Task $task -Success $true -Message "Not required, user declined."
+            return $true
+        }
+    }
+
+    if (-not $PSCmdlet.ShouldProcess("Computer", "Restart (user selected)")) {
+        Add-TaskResult -Task $task -Success $false -Message "Reboot optional, skipped by ShouldProcess."
+        return $false
+    }
+
+    Add-TaskResult -Task $task -Success $true -Message "Restart initiated. Rebooting in 5 seconds. Press Ctrl+C to cancel."
+		for ($i = 5; $i -gt 0; $i--) {
+            Write-Host ("Rebooting in {0}..." -f $i) -ForegroundColor Yellow
+            Start-Sleep -Seconds 1
+		}
+		
+    Restart-Computer -Force
+}
+
+# ---------------------------------------Exec ---------------------------------------
+
+Write-Host "Step 1/7: Restore point" -ForegroundColor Cyan
+Invoke-Task -Name "Create-RestorePoint"   -Block { Create-RestorePoint } | Out-Null
+
+Write-Host "Step 2/7: Windows Update" -ForegroundColor Cyan
+Invoke-Task -Name "Perform-WindowsUpdate" -Block { Perform-WindowsUpdate } | Out-Null
+$script:RebootRequired = Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired"
+
+Write-Host "Step 3/7: SFC and DISM (this takes a bit)" -ForegroundColor Cyan
+Invoke-Task -Name "Run-SystemFileChecks"  -Block { Run-SystemFileChecks } | Out-Null
+
+Write-Host "Step 4/7: Cleanup" -ForegroundColor Cyan
+Invoke-Task -Name "Cleanup-Files"         -Block { Cleanup-Files } | Out-Null
+
+Write-Host "Step 5/7: Optimize drives" -ForegroundColor Cyan
+Invoke-Task -Name "Optimize-Drives"       -Block { Optimize-Drives } | Out-Null
+
+Write-Host "Step 6/7: Time sync" -ForegroundColor Cyan
+Invoke-Task -Name "Resync-Time"           -Block { Resync-Time } | Out-Null
+
+Write-Host "Step 7/7: Reboot (optional)" -ForegroundColor Cyan
+Invoke-Task -Name "Reboot"                -Block { Invoke-RebootIfRequested } | Out-Null
+
+
+Write-Host ""
+Write-Host "System Maintenance Completed!" -ForegroundColor Cyan
+Write-Host ("Log saved to {0}" -f $LogFile) -ForegroundColor Green
+Write-Host ""
+Write-Host "Task Summary" -ForegroundColor Cyan
+$TaskResults | Format-Table -AutoSize
+
+if ($script:TranscriptStarted) {
+    try { Stop-Transcript | Out-Null } catch { }
+}
+Write-Verbose ("Reboot required by Windows Update: {0}" -f $script:RebootRequired)
