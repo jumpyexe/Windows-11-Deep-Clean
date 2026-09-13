@@ -1,7 +1,7 @@
 #Requires -RunAsAdministrator
 <#
 DESCRIPTION
-    Creates an optional restore point, checks Windows Update, runs SFC and DISM,
+    Creates an optional restore point, installs applicable Windows updates, runs SFC and DISM,
     cleans common temp locations, optimizes fixed drives, checks Windows Time,
     and prints a task summary. Raw native command output is saved separately.
     DEBUG logging is hidden unless -VerboseLog is used.
@@ -9,6 +9,7 @@ DESCRIPTION
 
 [CmdletBinding()]
 param(
+    [ValidateNotNullOrEmpty()]
     [string]$LogRoot = 'C:\Logs\Maintenance',
 
     [string[]]$NtpServers = @('time.nist.gov'),
@@ -30,6 +31,7 @@ param(
 
     [switch]$VerboseLog,
 
+    [ValidateRange(0, 100)]
     [int]$CleanupErrorSampleCount = 5,
 
     [switch]$NoRebootPrompt
@@ -227,13 +229,13 @@ function Invoke-NativeCommandClean {
         $progressPercent = $null
 
         if ($line -match '^Verification\s+(\d+(?:\.\d+)?)\s*%\s+complete\.?$') {
-            $progressPercent = [double]$matchess[1]
+            $progressPercent = [double]$Matches[1]
         }
         elseif ($line -match '^\[.*?(\d+(?:\.\d+)?)%.*\]$') {
-            $progressPercent = [double]$matchess[1]
+            $progressPercent = [double]$Matches[1]
         }
         elseif ($line -match '^(Retrim|Defragmentation|Consolidation):?\s+(\d+(?:\.\d+)?)\s*%\s+complete') {
-            $progressPercent = [double]$matchess[2]
+            $progressPercent = [double]$Matches[2]
         }
 
         if ($null -ne $progressPercent) {
@@ -296,18 +298,14 @@ function Get-SfcSummary {
         return 'SFC could not complete the requested operation.'
     }
 
-    if ($text -match 'Windows Resource Protection could not perform the requested operation') {
-    return 'SFC could not complete the requested operation.'
-	}
+    if (
+        $text -match 'Verification\s+100\s*%\s+complete' -and
+        $text -notmatch 'found corrupt files|could not perform|unable to fix'
+    ) {
+        return 'SFC completed successfully. No corruption summary string detected.'
+    }
 
-	if (
-    $text -match 'Verification\s+100\s*%\s+complete' -and
-    $text -notmatch 'found corrupt files|could not perform|unable to fix'
-	) {
-    return 'SFC completed successfully. No corruption summary string detected.'
-	}
-
-return 'No standard SFC summary string detected.'
+    return 'No standard SFC summary string detected.'
 }
 
 function Get-DismScanSummary {
@@ -596,18 +594,34 @@ function Invoke-WindowsUpdateCheck {
     $installSummary = Convert-OperationResultCode -ResultCode ([int]$installResult.ResultCode)
     Write-Log "Windows Update install result: $installSummary" 'INFO'
 
+    $failedUpdateCount = 0
     for ($i = 0; $i -lt $installableUpdates.Count; $i++) {
         $updateResult = $installResult.GetUpdateResult($i)
         $updateTitle = $installableUpdates.Item($i).Title
         $resultText = Convert-OperationResultCode -ResultCode ([int]$updateResult.ResultCode)
         Write-Log "Update result: $updateTitle : $resultText" 'INFO'
+
+        if ([int]$updateResult.ResultCode -ne 2) {
+            $failedUpdateCount++
+        }
     }
 
     $script:RebootRequired = $script:RebootRequired -or [bool]$installResult.RebootRequired -or (Get-RebootRequiredState)
     Write-Log "Reboot required by Windows Update: $script:RebootRequired" 'INFO'
 
-    $success = [int]$installResult.ResultCode -in 2, 3
-    Add-TaskResult -Task 'Perform-WindowsUpdate' -Success $success -Message "Installed $($installableUpdates.Count) update(s). Result: $installSummary."
+    $notDownloadedCount = $updates.Count - $installableUpdates.Count
+    $success = (
+        [int]$downloadResult.ResultCode -eq 2 -and
+        [int]$installResult.ResultCode -eq 2 -and
+        $notDownloadedCount -eq 0 -and
+        $failedUpdateCount -eq 0
+    )
+    $message = (
+        "Attempted $($installableUpdates.Count) update(s). " +
+        "Not downloaded: $notDownloadedCount. Failed or incomplete installs: $failedUpdateCount. " +
+        "Result: $installSummary."
+    )
+    Add-TaskResult -Task 'Perform-WindowsUpdate' -Success $success -Message $message
 }
 
 function Invoke-SystemFileChecks {
@@ -636,6 +650,8 @@ function Invoke-SystemFileChecks {
     Write-Log "DISM ScanHealth exit code: $($dismScan.ExitCode). Summary: $($dismScanSummary.Summary)" 'INFO'
 
     $dismFinalSummary = $dismScanSummary.Summary
+    $dismRestore = $null
+    $secondSfc = $null
     $secondSfcSummary = $null
 
     if ($dismScan.ExitCode -eq 0 -and $dismScanSummary.NeedsRestoreHealth) {
@@ -651,17 +667,22 @@ function Invoke-SystemFileChecks {
         $dismFinalSummary = Get-DismRestoreSummary -Output $dismRestore.CleanOutput
         Write-Log "DISM RestoreHealth exit code: $($dismRestore.ExitCode). Summary: $dismFinalSummary" 'INFO'
 
-        Write-Log 'Re-running SFC after DISM repair attempt.' 'INFO'
-        $secondSfcRawPath = Join-Path -Path $script:RawLogRoot -ChildPath "sfc-after-dism-$script:TimeStamp.raw.log"
-        $secondSfc = Invoke-NativeCommandClean `
-            -FilePath 'sfc.exe' `
-            -ArgumentList @('/scannow') `
-            -DisplayName 'Second SFC' `
-            -RawOutputPath $secondSfcRawPath `
-            -SuppressRoutineLines
+        if ($dismRestore.ExitCode -eq 0) {
+            Write-Log 'Re-running SFC after successful DISM repair.' 'INFO'
+            $secondSfcRawPath = Join-Path -Path $script:RawLogRoot -ChildPath "sfc-after-dism-$script:TimeStamp.raw.log"
+            $secondSfc = Invoke-NativeCommandClean `
+                -FilePath 'sfc.exe' `
+                -ArgumentList @('/scannow') `
+                -DisplayName 'Second SFC' `
+                -RawOutputPath $secondSfcRawPath `
+                -SuppressRoutineLines
 
-        $secondSfcSummary = Get-SfcSummary -Output $secondSfc.CleanOutput
-        Write-Log "Second SFC exit code: $($secondSfc.ExitCode). Summary: $secondSfcSummary" 'INFO'
+            $secondSfcSummary = Get-SfcSummary -Output $secondSfc.CleanOutput
+            Write-Log "Second SFC exit code: $($secondSfc.ExitCode). Summary: $secondSfcSummary" 'INFO'
+        }
+        else {
+            Write-Log 'Second SFC skipped because DISM RestoreHealth failed.' 'WARN'
+        }
     }
     elseif ($dismScan.ExitCode -eq 0 -and -not $dismScanSummary.NeedsRestoreHealth) {
         Write-Log 'DISM RestoreHealth skipped because ScanHealth did not detect component store corruption.' 'INFO'
@@ -670,10 +691,25 @@ function Invoke-SystemFileChecks {
         Write-Log 'DISM RestoreHealth skipped because ScanHealth did not complete cleanly.' 'WARN'
     }
 
-    $success = (
-        $dismScan.ExitCode -eq 0 -and
-        $sfcSummary -notmatch 'not fully repaired|could not complete'
-    )
+    if ($null -ne $dismRestore) {
+        $secondSfcSucceeded = (
+            $null -ne $secondSfc -and
+            $secondSfc.ExitCode -eq 0 -and
+            $secondSfcSummary -notmatch 'not fully repaired|could not complete|No standard'
+        )
+        $success = (
+            $dismScan.ExitCode -eq 0 -and
+            $dismRestore.ExitCode -eq 0 -and
+            $secondSfcSucceeded
+        )
+    }
+    else {
+        $sfcSucceeded = (
+            $sfcResult.ExitCode -eq 0 -and
+            $sfcSummary -notmatch 'not fully repaired|could not complete|No standard'
+        )
+        $success = $dismScan.ExitCode -eq 0 -and $sfcSucceeded
+    }
 
     $message = "SFC: $sfcSummary DISM: $dismFinalSummary"
     if ($secondSfcSummary) {
@@ -693,8 +729,8 @@ function Invoke-Cleanup {
     $freeBefore = Get-FixedDriveFreeSpace
     $targets = @(
         [pscustomobject]@{ Name = 'User Temp'; Path = $env:TEMP },
-        [pscustomobject]@{ Name = 'System Temp'; Path = 'C:\Windows\Temp' },
-        [pscustomobject]@{ Name = 'Windows Update Cache'; Path = 'C:\Windows\SoftwareDistribution\Download' }
+        [pscustomobject]@{ Name = 'System Temp'; Path = (Join-Path -Path $env:windir -ChildPath 'Temp') },
+        [pscustomobject]@{ Name = 'Windows Update Cache'; Path = (Join-Path -Path $env:windir -ChildPath 'SoftwareDistribution\Download') }
     )
 
     [int64]$estimatedRemoved = 0
@@ -710,26 +746,37 @@ function Invoke-Cleanup {
             $before = Get-DirectoryStats -Path $target.Path
             Write-Log "Cleanup target '$($target.Name)' before: $($before.Files) files, $(Format-ByteSize $before.Bytes)" 'INFO'
 
-            if ($target.Name -eq 'Windows Update Cache') {
-                try {
-                    Stop-Service -Name wuauserv -Force -ErrorAction Stop
-                    Stop-Service -Name bits -Force -ErrorAction Stop
-                    Write-Log 'Stopped Windows Update services for cache cleanup.' 'INFO'
-                }
-                catch {
-                    Write-Log "Unable to stop Windows Update services cleanly. $($_.Exception.Message)" 'WARN'
-                }
-            }
+            $serviceStates = [System.Collections.Generic.List[object]]::new()
+            try {
+                if ($target.Name -eq 'Windows Update Cache') {
+                    foreach ($serviceName in @('bits', 'wuauserv')) {
+                        $service = Get-Service -Name $serviceName -ErrorAction Stop
+                        $wasRunning = $service.Status -eq 'Running'
+                        $serviceStates.Add([pscustomobject]@{
+                            Name = $serviceName
+                            WasRunning = $wasRunning
+                        }) | Out-Null
 
-            $removeResult = Remove-DirectoryChildren -Path $target.Path -ErrorSampleCount $CleanupErrorSampleCount
-
-            if ($target.Name -eq 'Windows Update Cache') {
-                foreach ($service in @('bits', 'wuauserv')) {
-                    try {
-                        Start-Service -Name $service -ErrorAction Stop -WarningAction SilentlyContinue
+                        if ($wasRunning) {
+                            Stop-Service -Name $serviceName -Force -ErrorAction Stop
+                        }
                     }
-                    catch {
-                        Write-Log "Unable to start service '$service'. $($_.Exception.Message)" 'WARN'
+                    Write-Log 'Stopped running Windows Update services for cache cleanup.' 'INFO'
+                }
+
+                $removeResult = Remove-DirectoryChildren -Path $target.Path -ErrorSampleCount $CleanupErrorSampleCount
+            }
+            finally {
+                for ($i = $serviceStates.Count - 1; $i -ge 0; $i--) {
+                    $serviceState = $serviceStates[$i]
+                    if ($serviceState.WasRunning) {
+                        try {
+                            Start-Service -Name $serviceState.Name -ErrorAction Stop -WarningAction SilentlyContinue
+                        }
+                        catch {
+                            $hadErrors = $true
+                            Write-Log "Unable to restore service '$($serviceState.Name)' to its running state. $($_.Exception.Message)" 'WARN'
+                        }
                     }
                 }
             }
@@ -788,24 +835,24 @@ function Invoke-Cleanup {
 function Get-DefragTrimmedSpace {
     param([string[]]$Output)
 
-    $matchess = @(
+    $matchingLines = @(
         $Output | Where-Object {
             $_ -match 'Total space trimmed\s*=\s*(.+)$' -or
             $_ -match 'Allocations trimmed\s*=\s*(.+)$'
         }
     )
 
-    if ($matchess.Count -eq 0) {
+    if ($matchingLines.Count -eq 0) {
         return 'Not reported'
     }
 
-    $last = $matchess[-1]
+    $last = $matchingLines[-1]
     if ($last -match 'Total space trimmed\s*=\s*(.+)$') {
-        return $matchess[1].Trim()
+        return $Matches[1].Trim()
     }
 
     if ($last -match 'Allocations trimmed\s*=\s*(.+)$') {
-        return $matchess[1].Trim()
+        return $Matches[1].Trim()
     }
 
     return 'Not reported'
@@ -896,7 +943,7 @@ function Get-NtpOffsetSample {
 
     $offsets = foreach ($line in $stripchart.CleanOutput) {
         if ($line -match '([-+]?\d+(?:\.\d+)?)s') {
-            [double]$matchess[1] * 1000.0
+            [double]$Matches[1] * 1000.0
         }
     }
 
@@ -936,8 +983,20 @@ function Invoke-TimeSync {
     }
 
     $task = 'Resync-Time'
+    $validNtpServers = @(
+        $NtpServers |
+            ForEach-Object { if ($null -ne $_) { $_.Trim() } } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            Select-Object -Unique
+    )
+    if ($validNtpServers.Count -eq 0) {
+        Add-TaskResult -Task $task -Success $false -Message 'No valid NTP servers were provided.'
+        Write-Log 'Time sync requires at least one non-empty NTP server.' 'WARN'
+        return $false
+    }
+
     $peerList = (
-        $NtpServers | ForEach-Object {
+        $validNtpServers | ForEach-Object {
             if ($_ -match ',0x[0-9A-Fa-f]+$') {
                 $_
             }
@@ -961,8 +1020,14 @@ function Invoke-TimeSync {
 
     if ($svc.Status -ne 'Running') {
         Write-Log 'Starting Windows Time service.' 'INFO'
-        Start-Service -Name w32time -ErrorAction SilentlyContinue
+        Start-Service -Name w32time -ErrorAction Stop
         Start-Sleep -Seconds 2
+        $svc.Refresh()
+        if ($svc.Status -ne 'Running') {
+            Add-TaskResult -Task $task -Success $false -Message 'Windows Time service did not enter the running state.'
+            Write-Log 'Windows Time service did not enter the running state.' 'WARN'
+            return $false
+        }
     }
 
     Write-Log "Configuring NTP peers: $peerList" 'INFO'
@@ -1002,7 +1067,7 @@ function Invoke-TimeSync {
     }
 
     $postSyncSample = $null
-    foreach ($server in $NtpServers) {
+    foreach ($server in $validNtpServers) {
         $serverName = ($server -replace ',0x[0-9A-Fa-f]+$', '')
         $sample = Get-NtpOffsetSample -Server $serverName
 
@@ -1023,7 +1088,13 @@ function Invoke-TimeSync {
         return $false
     }
 
-    if ($resync.ExitCode -eq 0 -and $sourceText -notmatch 'Local CMOS Clock' -and $postSyncSample) {
+    $sourceConfirmed = (
+        $source.ExitCode -eq 0 -and
+        $status.ExitCode -eq 0 -and
+        $sourceText -notin @('Unknown', 'Local CMOS Clock')
+    )
+
+    if ($resync.ExitCode -eq 0 -and $sourceConfirmed -and $postSyncSample) {
         if ($postSyncSample.AbsOffsetMs -gt $OffsetThresholdMs) {
             Add-TaskResult `
                 -Task $task `
@@ -1044,7 +1115,10 @@ function Invoke-TimeSync {
     Add-TaskResult `
         -Task $task `
         -Success $false `
-        -Message "Time resync failed or source not confirmed. Resync exit: $($resync.ExitCode). Source: $sourceText."
+        -Message (
+            "Time resync failed or source not confirmed. Resync exit: $($resync.ExitCode). " +
+            "Source query exit: $($source.ExitCode). Status query exit: $($status.ExitCode). Source: $sourceText."
+        )
 
     return $false
 }
@@ -1083,8 +1157,15 @@ function Invoke-RebootStep {
 }
 
 function Show-TaskSummary {
+    $failedTaskCount = @($script:TaskResults | Where-Object { -not $_.Success }).Count
+
     Write-Host ''
-    Write-Host 'System Maintenance Completed!'
+    if ($failedTaskCount -eq 0) {
+        Write-Host 'System Maintenance Completed!'
+    }
+    else {
+        Write-Host "System Maintenance Completed with $failedTaskCount failed task(s)."
+    }
     Write-Host "Log saved to $script:LogPath"
     Write-Host "Raw command logs saved to $script:RawLogRoot"
     if ($script:TranscriptPath) {
@@ -1107,9 +1188,10 @@ try {
     Write-Host 'System Maintenance Started!'
     Write-Log "Log file: $script:LogPath" 'INFO'
     Write-Log "Raw log folder: $script:RawLogRoot" 'INFO'
-    Write-Log "Running elevated: $(Test-IsAdmin)" 'INFO'
+    $isAdmin = Test-IsAdmin
+    Write-Log "Running elevated: $isAdmin" 'INFO'
 
-    if (-not (Test-IsAdmin)) {
+    if (-not $isAdmin) {
         throw 'This script must run elevated.'
     }
 
@@ -1135,8 +1217,14 @@ try {
     Invoke-Step -Name 'Reboot' -ScriptBlock { Invoke-RebootStep }
 }
 catch {
-    Write-Log "Fatal script error. $($_.Exception.Message)" 'ERROR'
-    Add-TaskResult -Task 'Fatal' -Success $false -Message $_.Exception.Message
+    $fatalMessage = $_.Exception.Message
+    try {
+        Write-Log "Fatal script error. $fatalMessage" 'ERROR'
+    }
+    catch {
+        Write-Warning "Fatal script error. $fatalMessage"
+    }
+    Add-TaskResult -Task 'Fatal' -Success $false -Message $fatalMessage
 }
 finally {
     Show-TaskSummary
